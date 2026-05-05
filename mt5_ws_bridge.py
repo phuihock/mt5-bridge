@@ -1,12 +1,8 @@
-"""
-mt5_ws_bridge.py — Windows-side bridge for Nautilus Trader MT5 adapter.
+"""mt5_ws_bridge.py — Windows-side bridge for Nautilus Trader MT5 adapter.
 
 Architecture:
   - WebSocket ws://0.0.0.0:9876/ws  → push completed bars (from DOM mid-price)
   - REST     http://0.0.0.0:9877/rpc → request/response (orders, positions, symbols)
-
-Darwinex CFD quirk: DOM type=1=ASK(offer), type=2=BID(buy) — inverted from MT5 standard.
-Bridge auto-detects this on first DOM read.
 
 Usage:
   python mt5_ws_bridge.py
@@ -14,7 +10,6 @@ Usage:
 """
 
 import asyncio
-import json
 import time
 import logging
 import signal
@@ -47,7 +42,7 @@ def to_python(obj):
     if obj is None:
         return None
     if isinstance(obj, np.ndarray):
-        return json.loads(pd.DataFrame(obj).to_json(orient="records"))
+        return pd.DataFrame(obj).to_dict(orient="records")
     # _asdict check first — MT5 namedtuples inherit from tuple
     if hasattr(obj, "_asdict"):
         return _recursive_asdict(obj)
@@ -364,8 +359,9 @@ class MT5WSBridge:
 
         elif method == "symbols_get":
             group = params.get("group")
-            func = (lambda: mt5.symbols_get(group)) if group else mt5.symbols_get
-            return to_python(await asyncio.to_thread(func))
+            if group:
+                return to_python(await asyncio.to_thread(mt5.symbols_get, group))
+            return to_python(await asyncio.to_thread(mt5.symbols_get))
 
         elif method == "symbol_info":
             info = await asyncio.to_thread(mt5.symbol_info, params["symbol"])
@@ -393,13 +389,15 @@ class MT5WSBridge:
 
         elif method == "orders_get":
             symbol = params.get("symbol")
-            func = (lambda: mt5.orders_get(symbol=symbol)) if symbol else mt5.orders_get
-            return to_python(await asyncio.to_thread(func))
+            if symbol:
+                return to_python(await asyncio.to_thread(mt5.orders_get, symbol=symbol))
+            return to_python(await asyncio.to_thread(mt5.orders_get))
 
         elif method == "positions_get":
             symbol = params.get("symbol")
-            func = (lambda: mt5.positions_get(symbol=symbol)) if symbol else mt5.positions_get
-            return to_python(await asyncio.to_thread(func))
+            if symbol:
+                return to_python(await asyncio.to_thread(mt5.positions_get, symbol=symbol))
+            return to_python(await asyncio.to_thread(mt5.positions_get))
 
         elif method == "history_deals_get":
             deals = await asyncio.to_thread(
