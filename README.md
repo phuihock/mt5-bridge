@@ -5,21 +5,19 @@ Connects MetaTrader 5 (Darwinex) to Nautilus Trader on WSL2. Runs on Windows whe
 ## Architecture
 
 ```
-WSL2 (Nautilus Trader)             Windows (MT5 Terminal)
-┌────────────────────┐             ┌─────────────────────┐
-│ MT5WSClient        │◄───WS──────►│ mt5_ws_bridge.py   │
-│ (aiohttp WS + REST)│    :9876    │                     │
-│                    │◄───REST────►│ - DOM → M1 bars     │
-│                    │    :9877    │ - order_send        │
-│                    │             │ - positions_get     │
-│                    │             │ - symbols_get       │
-└────────────────────┘             │ - copy_rates_*      │
-                                    └─────────┬───────────┘
-                                              │ mt5.* IPC
-                                    ┌─────────┴───────────┐
-                                    │ MT5 Terminal        │
-                                    │ (Darwinex logged in)│
-                                    └─────────────────────┘
+```mermaid
+flowchart LR
+    subgraph WSL2[Nautilus Trader]
+        NA[MT5WSClient<br/>aiohttp WS + REST]
+    end
+    subgraph Windows[Windows Host]
+        BR[mt5_ws_bridge.py<br/>DOM &rarr; bar accumulator<br/>order_send / positions_get<br/>symbols_get / copy_rates_*]
+        MT5[MT5 Terminal<br/>Darwinex logged in]
+        BR --->|mt5.* IPC| MT5
+    end
+    NA -- "WS :9876<br/>bar push" --> BR
+    NA -- "REST :9877<br/>orders, positions" --> BR
+```
 ```
 
 **Two transports:**
