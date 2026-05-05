@@ -1,0 +1,527 @@
+"""
+mt5_ws_bridge.py — Windows-side bridge for Nautilus Trader MT5 adapter.
+
+Architecture:
+  - WebSocket ws://0.0.0.0:9876/ws  → push completed bars (from DOM mid-price)
+  - REST     http://0.0.0.0:9877/rpc → request/response (orders, positions, symbols)
+
+Darwinex CFD quirk: DOM type=1=ASK(offer), type=2=BID(buy) — inverted from MT5 standard.
+Bridge auto-detects this on first DOM read.
+
+Usage:
+  python mt5_ws_bridge.py
+  python mt5_ws_bridge.py --mt5-path "C:\Program Files\Darwinex MetaTrader 5\terminal64.exe"
+"""
+
+import asyncio
+import json
+import time
+import logging
+import signal
+import sys
+import argparse
+from dataclasses import dataclass, field
+
+import numpy as np
+import MetaTrader5 as mt5
+from aiohttp import web
+
+logger = logging.getLogger("mt5-bridge")
+
+# ── Serialization helper ──────────────────────────────────────────────
+
+def _to_json_safe(obj):
+    """Convert an MT5 result (namedtuple or numpy.void) to a JSON-safe dict."""
+    if hasattr(obj, "_asdict"):
+        d = obj._asdict()
+    elif hasattr(obj, "dtype"):
+        d = {name: obj[name] for name in obj.dtype.names}
+    else:
+        d = obj
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, (np.integer,)):
+            out[k] = int(v)
+        elif isinstance(v, (np.floating,)):
+            out[k] = float(v)
+        elif isinstance(v, np.bool_):
+            out[k] = bool(v)
+        elif isinstance(v, np.ndarray):
+            out[k] = v.tolist()
+        else:
+            out[k] = v
+    return out
+
+
+def _rows_to_json(rows):
+    """Convert an iterable of MT5 rows to a list of JSON-safe dicts."""
+    if rows is None:
+        return []
+    return [_to_json_safe(r) for r in rows]
+
+
+# ── DOM type detection ────────────────────────────────────────────────
+
+# ── Bar Accumulator ────────────────────────────────────────────────────
+
+@dataclass
+class BarAccumulator:
+    """Accumulates DOM mid-price ticks into OHLCV bars for one symbol/timeframe."""
+    symbol: str
+    timeframe_secs: int
+    open: float = 0.0
+    high: float = 0.0
+    low: float = float('inf')
+    close: float = 0.0
+    volume: float = 0.0
+    bar_open_ns: int = 0
+    tick_count: int = 0
+    _pending: list = field(default_factory=list)
+
+    def on_mid_price(self, mid: float, total_vol: float, ts_ns: int):
+        tf_ns = self.timeframe_secs * 1_000_000_000
+        bar_start = (ts_ns // tf_ns) * tf_ns
+
+        if self.bar_open_ns != 0 and bar_start != self.bar_open_ns:
+            self._pending.append({
+                "type": "bar",
+                "symbol": self.symbol,
+                "timeframe_secs": self.timeframe_secs,
+                "open": self.open,
+                "high": self.high,
+                "low": self.low if self.low != float('inf') else self.open,
+                "close": self.close,
+                "volume": int(self.volume),
+                "tick_count": self.tick_count,
+                "ts_open_ns": self.bar_open_ns,
+                "ts_close_ns": ts_ns,
+            })
+            self.open = mid
+            self.high = mid
+            self.low = mid
+            self.bar_open_ns = bar_start
+        elif self.bar_open_ns == 0:
+            self.open = mid
+            self.high = mid
+            self.low = mid
+            self.bar_open_ns = bar_start
+
+        self.high = max(self.high, mid)
+        self.low = min(self.low, mid)
+        self.close = mid
+        self.volume += total_vol
+        self.tick_count += 1
+
+    def drain(self) -> list:
+        out = self._pending
+        self._pending = []
+        return out
+
+
+# ── Bridge ─────────────────────────────────────────────────────────────
+
+class MT5WSBridge:
+    """Main bridge: MT5 DOM → WS bar push + REST RPC for orders/positions."""
+
+    def __init__(self, ws_port=9876, rest_port=9877, mt5_path: str = None):
+        self.ws_port = ws_port
+        self.rest_port = rest_port
+        self.mt5_path = mt5_path
+
+        self._running = False
+        self._ws_clients: set[web.WebSocketResponse] = set()
+        self._accumulators: dict[tuple[str, int], BarAccumulator] = {}
+        self._last_bars: dict[tuple[str, int], dict] = {}  # for WS reconnect replay
+
+        # DOM type mapping: use mt5 constants directly
+        self._bid_type = mt5.BOOK_TYPE_BUY   # which is 2 on this broker
+        self._ask_type = mt5.BOOK_TYPE_SELL  # which is 1 on this broker
+
+        # Health
+        self._mt5_ok = False
+        self._last_health_check = 0.0
+        self._health_check_interval = 60.0
+        self._last_account_info = None
+
+    # ── MT5 lifecycle ──────────────────────────────────────────────
+
+    def mt5_init(self) -> bool:
+        # Try auto-detect first (connects to already-running terminal).
+        # Fall back to explicit path if auto-detect fails.
+        ok = mt5.initialize()
+        if not ok:
+            logger.warning(f"Auto-detect failed: {mt5.last_error()}")
+            if self.mt5_path:
+                logger.info(f"Trying explicit path: {self.mt5_path}")
+                ok = mt5.initialize(path=self.mt5_path)
+        self._mt5_ok = ok
+        if ok:
+            info = mt5.terminal_info()
+            self._last_account_info = mt5.account_info()
+            logger.info(f"MT5: {info.name} build={info.build}")
+            logger.info(f"Account: {self._last_account_info}")
+        else:
+            logger.error(f"MT5 init failed: {mt5.last_error()}")
+        return ok
+
+    def mt5_shutdown(self):
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+        self._mt5_ok = False
+        logger.info("MT5 shut down")
+
+    def check_health(self):
+        now = time.time()
+        if now - self._last_health_check < self._health_check_interval:
+            return
+        self._last_health_check = now
+        info = mt5.account_info()
+        if info is None:
+            logger.warning("Health check: MT5 disconnected, reinitializing...")
+            self.mt5_shutdown()
+            self.mt5_init()
+        else:
+            self._last_account_info = info
+
+    # ── DOM type auto-detection ────────────────────────────────────
+
+    def _detect_dom_types(self, symbol: str):
+        """Auto-detect which BookInfo.type is BID vs ASK for this broker.
+        Uses mt5.* constants. Falls back to price comparison."""
+        self._bid_type = mt5.BOOK_TYPE_BUY
+        self._ask_type = mt5.BOOK_TYPE_SELL
+        if self._bid_type == self._ask_type:
+            # Constants not available — use price heuristic
+            items = mt5.market_book_get(symbol)
+            if items and len(items) >= 2:
+                avg1 = sum(it.price for it in items if it.type == 1) / max(len([it for it in items if it.type == 1]), 1)
+                avg2 = sum(it.price for it in items if it.type == 2) / max(len([it for it in items if it.type == 2]), 1)
+                if avg1 > avg2:
+                    self._ask_type, self._bid_type = 1, 2
+                else:
+                    self._bid_type, self._ask_type = 1, 2
+        logger.info(f"DOM type: bid=type{self._bid_type} ask=type{self._ask_type}")
+
+    # ── DOM subscription ───────────────────────────────────────────
+
+    def subscribe_dom(self, symbol: str, timeframes_secs: list[int]):
+        if not mt5.market_book_add(symbol):
+            err = mt5.last_error()
+            raise RuntimeError(f"market_book_add({symbol}) failed: {err}")
+
+        # Verify DOM types (one-time)
+        self._detect_dom_types(symbol)
+
+        for tf in timeframes_secs:
+            key = (symbol, tf)
+            if key not in self._accumulators:
+                self._accumulators[key] = BarAccumulator(symbol, tf)
+                logger.info(f"Subscribed: {symbol} TF={tf}s")
+
+    def unsubscribe_dom(self, symbol: str):
+        try:
+            mt5.market_book_release(symbol)
+        except Exception:
+            pass
+        keys = [k for k in self._accumulators if k[0] == symbol]
+        for k in keys:
+            del self._accumulators[k]
+        logger.info(f"Unsubscribed: {symbol}")
+
+    # ── DOM poll loop ──────────────────────────────────────────────
+
+    async def _poll_loop(self):
+        """Poll DOM every 50ms, feed accumulators, push bars to WS clients."""
+        while self._running:
+            try:
+                self.check_health()
+
+                symbols = set(k[0] for k in self._accumulators)
+                for symbol in symbols:
+                    items = mt5.market_book_get(symbol)
+                    if items is None:
+                        continue
+
+                    # Extract best bid and best ask using detected types
+                    best_bid = None
+                    best_ask = None
+                    total_vol = 0.0
+                    for item in items:
+                        total_vol += item.volume_dbl
+                        if item.type == self._bid_type:
+                            if best_bid is None or item.price > best_bid:
+                                best_bid = item.price
+                        elif item.type == self._ask_type:
+                            if best_ask is None or item.price < best_ask:
+                                best_ask = item.price
+
+                    if best_bid is None or best_ask is None:
+                        continue
+
+                    mid = (best_bid + best_ask) / 2.0
+                    ts_ns = time.time_ns()
+
+                    for (sym, tf), acc in self._accumulators.items():
+                        if sym == symbol:
+                            acc.on_mid_price(mid, total_vol, ts_ns)
+
+                # Drain and push
+                all_bars = []
+                for key, acc in self._accumulators.items():
+                    bars = acc.drain()
+                    for bar in bars:
+                        self._last_bars[key] = bar
+                    all_bars.extend(bars)
+
+                if all_bars:
+                    msg = json.dumps({"type": "bars", "data": all_bars})
+                    dead = set()
+                    for ws in self._ws_clients:
+                        try:
+                            await ws.send_str(msg)
+                        except Exception:
+                            dead.add(ws)
+                    self._ws_clients -= dead
+
+            except Exception as e:
+                logger.error(f"Poll loop error: {e}", exc_info=True)
+
+            await asyncio.sleep(0.05)
+
+    # ── WebSocket handler ──────────────────────────────────────────
+
+    async def _ws_handler(self, request):
+        ws = web.WebSocketResponse(max_msg_size=65536)
+        await ws.prepare(request)
+        self._ws_clients.add(ws)
+        logger.info(f"WS client connected ({len(self._ws_clients)} total)")
+
+        # Replay last bars for reconnecting client
+        if self._last_bars:
+            replay = list(self._last_bars.values())
+            await ws.send_str(json.dumps({"type": "bars", "data": replay}))
+
+        try:
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                        await self._handle_ws_message(ws, data)
+                    except json.JSONDecodeError:
+                        logger.warning(f"Bad WS JSON: {msg.data}")
+                elif msg.type == web.WSMsgType.ERROR:
+                    logger.warning(f"WS error: {ws.exception()}")
+                    break
+        finally:
+            self._ws_clients.discard(ws)
+            logger.info(f"WS client left ({len(self._ws_clients)} remaining)")
+        return ws
+
+    async def _handle_ws_message(self, ws, data: dict):
+        cmd = data.get("type")
+        if cmd == "subscribe":
+            symbol = data["symbol"]
+            timeframes = data.get("timeframes", [60])
+            try:
+                self.subscribe_dom(symbol, timeframes)
+                await ws.send_str(json.dumps({
+                    "type": "subscribed",
+                    "symbol": symbol,
+                    "timeframes": timeframes,
+                }))
+            except Exception as e:
+                await ws.send_str(json.dumps({
+                    "type": "error",
+                    "message": str(e),
+                }))
+        elif cmd == "unsubscribe":
+            self.unsubscribe_dom(data["symbol"])
+            await ws.send_str(json.dumps({
+                "type": "unsubscribed",
+                "symbol": data["symbol"],
+            }))
+        elif cmd == "ping":
+            await ws.send_str(json.dumps({"type": "pong"}))
+        else:
+            logger.warning(f"Unknown WS command: {cmd}")
+
+    # ── REST RPC handler ───────────────────────────────────────────
+
+    async def _rest_handler(self, request):
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        method = body.get("method", "")
+        params = body.get("params", {})
+        logger.debug(f"RPC: {method}")
+
+        try:
+            result = await self._dispatch_rpc(method, params)
+            return web.json_response({"result": result})
+        except Exception as e:
+            logger.error(f"RPC {method} failed: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _dispatch_rpc(self, method: str, params: dict) -> any:
+        if method == "initialize":
+            return await asyncio.to_thread(self.mt5_init)
+
+        elif method == "shutdown":
+            await asyncio.to_thread(self.mt5_shutdown)
+            return True
+
+        elif method == "symbols_get":
+            group = params.get("group")
+            if group:
+                return _rows_to_json(await asyncio.to_thread(mt5.symbols_get, group))
+            return _rows_to_json(await asyncio.to_thread(mt5.symbols_get))
+
+        elif method == "symbol_info":
+            info = await asyncio.to_thread(mt5.symbol_info, params["symbol"])
+            return _to_json_safe(info) if info else None
+
+        elif method == "copy_rates_range":
+            rates = await asyncio.to_thread(
+                mt5.copy_rates_range,
+                params["symbol"], params["timeframe"],
+                params["date_from"], params["date_to"],
+            )
+            return _rows_to_json(rates)
+
+        elif method == "copy_rates_from_pos":
+            rates = await asyncio.to_thread(
+                mt5.copy_rates_from_pos,
+                params["symbol"], params["timeframe"],
+                params.get("start_pos", 0), params.get("count", 100),
+            )
+            return _rows_to_json(rates)
+
+        elif method == "order_send":
+            # mt5.order_send accepts a plain dict (official MT5 Python API convention)
+            res = await asyncio.to_thread(mt5.order_send, params["request"])
+            return _to_json_safe(res) if res else {"retcode": -1, "comment": str(mt5.last_error())}
+
+        elif method == "orders_get":
+            symbol = params.get("symbol")
+            if symbol:
+                return _rows_to_json(await asyncio.to_thread(mt5.orders_get, symbol=symbol))
+            return _rows_to_json(await asyncio.to_thread(mt5.orders_get))
+
+        elif method == "positions_get":
+            symbol = params.get("symbol")
+            if symbol:
+                return _rows_to_json(await asyncio.to_thread(mt5.positions_get, symbol=symbol))
+            return _rows_to_json(await asyncio.to_thread(mt5.positions_get))
+
+        elif method == "history_deals_get":
+            deals = await asyncio.to_thread(mt5.history_deals_get, params["date_from"], params["date_to"])
+            return _rows_to_json(deals)
+
+        elif method == "history_orders_get":
+            orders = await asyncio.to_thread(mt5.history_orders_get, params["date_from"], params["date_to"])
+            return _rows_to_json(orders)
+
+        elif method == "account_info":
+            info = await asyncio.to_thread(mt5.account_info)
+            return _to_json_safe(info) if info else None
+
+        elif method == "terminal_info":
+            info = await asyncio.to_thread(mt5.terminal_info)
+            return _to_json_safe(info) if info else None
+
+        elif method == "last_error":
+            return mt5.last_error()
+
+        else:
+            raise ValueError(f"Unknown method: {method}")
+
+    # ── Server lifecycle ───────────────────────────────────────────
+
+    async def start(self):
+        self._running = True
+        if not await asyncio.to_thread(self.mt5_init):
+            return False
+
+        app = web.Application()
+        app.router.add_get("/ws", self._ws_handler)
+        app.router.add_post("/rpc", self._rest_handler)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+
+        ws_site = web.TCPSite(runner, "0.0.0.0", self.ws_port)
+        rest_site = web.TCPSite(runner, "0.0.0.0", self.rest_port)
+        await ws_site.start()
+        await rest_site.start()
+
+        logger.info(f"Bridge: WS :{self.ws_port}/ws, REST :{self.rest_port}/rpc")
+
+        asyncio.create_task(self._poll_loop())
+        return True
+
+    def stop(self):
+        self._running = False
+        symbols = set(k[0] for k in self._accumulators)
+        for s in symbols:
+            try:
+                mt5.market_book_release(s)
+            except Exception:
+                pass
+        self.mt5_shutdown()
+        logger.info("Bridge stopped")
+
+
+# ── CLI ────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="MT5 Bridge for Nautilus Trader")
+    parser.add_argument("--mt5-path", help="Path to terminal64.exe")
+    parser.add_argument("--ws-port", type=int, default=9876)
+    parser.add_argument("--rest-port", type=int, default=9877)
+    parser.add_argument("--log-level", default="INFO")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper()),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    bridge = MT5WSBridge(
+        ws_port=args.ws_port,
+        rest_port=args.rest_port,
+        mt5_path=args.mt5_path,
+    )
+
+    async def run():
+        started = await bridge.start()
+        if not started:
+            sys.exit(1)
+        while bridge._running:
+            await asyncio.sleep(1)
+
+    def handle_signal():
+        logger.info("Shutting down...")
+        bridge.stop()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, handle_signal)
+            except NotImplementedError:
+                pass
+        loop.run_until_complete(run())
+    except KeyboardInterrupt:
+        bridge.stop()
+    finally:
+        loop.close()
+
+
+if __name__ == "__main__":
+    main()
