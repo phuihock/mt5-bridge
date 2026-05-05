@@ -11,7 +11,7 @@ flowchart LR
         NA[MT5WSClient<br/>aiohttp WS + REST]
     end
     subgraph Windows[Windows Host]
-        BR[mt5_ws_bridge.py<br/>DOM &rarr; bar accumulator<br/>order_send / positions_get<br/>symbols_get / copy_rates_*]
+        BR[mt5_ws_bridge.py<br/><ul><li>DOM &rarr; bar accumulator</li><li>order_send</li><li>positions_get</li><li>symbols_get</li><li>copy_rates_*</li>]
         MT5[MT5 Terminal<br/>Darwinex logged in]
         BR --->|mt5.* IPC| MT5
     end
