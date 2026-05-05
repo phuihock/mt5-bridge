@@ -60,7 +60,12 @@ def _rows_to_json(rows):
     return [_to_json_safe(r) for r in rows]
 
 
-# ── DOM type detection ────────────────────────────────────────────────
+# ── DOM type constants ───────────────────────────────────────────────
+# MQL5 ENUM_BOOK_TYPE: BOOK_TYPE_SELL=0 (Offer/ASK), BOOK_TYPE_BUY=1 (Bid)
+# Python MetaTrader5 adds 1: BOOK_TYPE_SELL=1, BOOK_TYPE_BUY=2
+# This is standard across all brokers — do NOT use price heuristics.
+DOM_TYPE_BID = mt5.BOOK_TYPE_BUY   # = 2
+DOM_TYPE_ASK = mt5.BOOK_TYPE_SELL  # = 1
 
 # ── Bar Accumulator ────────────────────────────────────────────────────
 
@@ -133,9 +138,9 @@ class MT5WSBridge:
         self._accumulators: dict[tuple[str, int], BarAccumulator] = {}
         self._last_bars: dict[tuple[str, int], dict] = {}  # for WS reconnect replay
 
-        # DOM type mapping: use mt5 constants directly
-        self._bid_type = mt5.BOOK_TYPE_BUY   # which is 2 on this broker
-        self._ask_type = mt5.BOOK_TYPE_SELL  # which is 1 on this broker
+        # DOM type mapping: hard-coded per MQL5 standard
+        self._bid_type = DOM_TYPE_BID  # = mt5.BOOK_TYPE_BUY = 2
+        self._ask_type = DOM_TYPE_ASK  # = mt5.BOOK_TYPE_SELL = 1
 
         # Health
         self._mt5_ok = False
@@ -185,24 +190,7 @@ class MT5WSBridge:
         else:
             self._last_account_info = info
 
-    # ── DOM type auto-detection ────────────────────────────────────
-
-    def _detect_dom_types(self, symbol: str):
-        """Auto-detect which BookInfo.type is BID vs ASK for this broker.
-        Uses mt5.* constants. Falls back to price comparison."""
-        self._bid_type = mt5.BOOK_TYPE_BUY
-        self._ask_type = mt5.BOOK_TYPE_SELL
-        if self._bid_type == self._ask_type:
-            # Constants not available — use price heuristic
-            items = mt5.market_book_get(symbol)
-            if items and len(items) >= 2:
-                avg1 = sum(it.price for it in items if it.type == 1) / max(len([it for it in items if it.type == 1]), 1)
-                avg2 = sum(it.price for it in items if it.type == 2) / max(len([it for it in items if it.type == 2]), 1)
-                if avg1 > avg2:
-                    self._ask_type, self._bid_type = 1, 2
-                else:
-                    self._bid_type, self._ask_type = 1, 2
-        logger.info(f"DOM type: bid=type{self._bid_type} ask=type{self._ask_type}")
+    # DOM types are hard-coded per MQL5 standard — no detection needed.
 
     # ── DOM subscription ───────────────────────────────────────────
 
@@ -210,9 +198,6 @@ class MT5WSBridge:
         if not mt5.market_book_add(symbol):
             err = mt5.last_error()
             raise RuntimeError(f"market_book_add({symbol}) failed: {err}")
-
-        # Verify DOM types (one-time)
-        self._detect_dom_types(symbol)
 
         for tf in timeframes_secs:
             key = (symbol, tf)
