@@ -23,7 +23,7 @@ import argparse
 from dataclasses import dataclass, field
 
 import numpy as np
-from json import JSONDecodeError
+import pandas as pd
 import orjson
 import MetaTrader5 as mt5
 from aiohttp import web
@@ -35,25 +35,25 @@ logger = logging.getLogger("mt5-bridge")
 ORJSON_OPT = orjson.OPT_UTC_Z
 
 
-def _to_json_safe(obj):
-    """Convert an MT5 row (namedtuple or numpy.void) to a JSON-safe dict."""
+def _recursive_asdict(o):
+    """Recursively convert MT5 structseqs to plain dicts."""
+    if hasattr(o, "_asdict"):
+        return {k: _recursive_asdict(v) for k, v in o._asdict().items()}
+    return o
+
+
+def to_python(obj):
+    """Convert any MT5 return object to plain Python (recursive)."""
     if obj is None:
         return None
+    if isinstance(obj, np.ndarray):
+        return json.loads(pd.DataFrame(obj).to_json(orient="records"))
+    # _asdict check first — MT5 namedtuples inherit from tuple
     if hasattr(obj, "_asdict"):
-        d = obj._asdict()
-    elif hasattr(obj, "dtype"):
-        d = {name: obj[name] for name in obj.dtype.names}
-    else:
-        d = dict(obj)
-    # Cast any numpy type leftovers (intc, etc) that orjson won't handle
-    return {k: int(v) if isinstance(v, np.integer) else float(v) if isinstance(v, np.floating) else bool(v) if isinstance(v, np.bool_) else v for k, v in d.items()}
-
-
-def _rows_to_json(rows):
-    """Convert MT5 rows to list of dicts."""
-    if rows is None:
-        return []
-    return [_to_json_safe(r) for r in rows]
+        return _recursive_asdict(obj)
+    if isinstance(obj, (tuple, list)):
+        return [to_python(x) for x in obj]
+    return obj
 
 
 # ── DOM type constants ───────────────────────────────────────────────
@@ -337,7 +337,7 @@ class MT5WSBridge:
     async def _rest_handler(self, request):
         try:
             body = await request.json()
-        except JSONDecodeError:
+        except (ValueError, orjson.JSONDecodeError):
             body = orjson.dumps({"error": "Invalid JSON"}, option=ORJSON_OPT)
             return web.Response(body=body, status=400, content_type="application/json")
 
@@ -364,78 +364,60 @@ class MT5WSBridge:
 
         elif method == "symbols_get":
             group = params.get("group")
-            if group:
-                return _rows_to_json(await asyncio.to_thread(mt5.symbols_get, group))
-            return _rows_to_json(await asyncio.to_thread(mt5.symbols_get))
+            func = (lambda: mt5.symbols_get(group)) if group else mt5.symbols_get
+            return to_python(await asyncio.to_thread(func))
 
         elif method == "symbol_info":
             info = await asyncio.to_thread(mt5.symbol_info, params["symbol"])
-            return _to_json_safe(info) if info else None
+            return to_python(info)
 
         elif method == "copy_rates_range":
             rates = await asyncio.to_thread(
                 mt5.copy_rates_range,
-                params["symbol"],
-                params["timeframe"],
-                params["date_from"],
-                params["date_to"],
+                params["symbol"], params["timeframe"],
+                params["date_from"], params["date_to"],
             )
-            return _rows_to_json(rates)
+            return to_python(rates)
 
         elif method == "copy_rates_from_pos":
             rates = await asyncio.to_thread(
                 mt5.copy_rates_from_pos,
-                params["symbol"],
-                params["timeframe"],
-                params.get("start_pos", 0),
-                params.get("count", 100),
+                params["symbol"], params["timeframe"],
+                params.get("start_pos", 0), params.get("count", 100),
             )
-            return _rows_to_json(rates)
+            return to_python(rates)
 
         elif method == "order_send":
             res = await asyncio.to_thread(mt5.order_send, params["request"])
-            if res is None:
-                return {"retcode": -1, "comment": str(mt5.last_error())}
-            d = _to_json_safe(res)
-            if "request" in d:
-                d["request"] = _to_json_safe(d["request"])
-            return d
+            return to_python(res) if res else {"retcode": -1, "comment": str(mt5.last_error())}
 
         elif method == "orders_get":
             symbol = params.get("symbol")
-            if symbol:
-                return _rows_to_json(
-                    await asyncio.to_thread(mt5.orders_get, symbol=symbol)
-                )
-            return _rows_to_json(await asyncio.to_thread(mt5.orders_get))
+            func = (lambda: mt5.orders_get(symbol=symbol)) if symbol else mt5.orders_get
+            return to_python(await asyncio.to_thread(func))
 
         elif method == "positions_get":
             symbol = params.get("symbol")
-            if symbol:
-                return _rows_to_json(
-                    await asyncio.to_thread(mt5.positions_get, symbol=symbol)
-                )
-            return _rows_to_json(await asyncio.to_thread(mt5.positions_get))
+            func = (lambda: mt5.positions_get(symbol=symbol)) if symbol else mt5.positions_get
+            return to_python(await asyncio.to_thread(func))
 
         elif method == "history_deals_get":
             deals = await asyncio.to_thread(
                 mt5.history_deals_get, params["date_from"], params["date_to"]
             )
-            return _rows_to_json(deals)
+            return to_python(deals)
 
         elif method == "history_orders_get":
             orders = await asyncio.to_thread(
                 mt5.history_orders_get, params["date_from"], params["date_to"]
             )
-            return _rows_to_json(orders)
+            return to_python(orders)
 
         elif method == "account_info":
-            info = await asyncio.to_thread(mt5.account_info)
-            return _to_json_safe(info) if info else None
+            return to_python(await asyncio.to_thread(mt5.account_info))
 
         elif method == "terminal_info":
-            info = await asyncio.to_thread(mt5.terminal_info)
-            return _to_json_safe(info) if info else None
+            return to_python(await asyncio.to_thread(mt5.terminal_info))
 
         elif method == "last_error":
             return mt5.last_error()
