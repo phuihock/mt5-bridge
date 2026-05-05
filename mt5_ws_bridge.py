@@ -23,6 +23,8 @@ import argparse
 from dataclasses import dataclass, field
 
 import numpy as np
+from json import JSONDecodeError
+import orjson
 import MetaTrader5 as mt5
 from aiohttp import web
 
@@ -30,31 +32,25 @@ logger = logging.getLogger("mt5-bridge")
 
 # ── Serialization helper ──────────────────────────────────────────────
 
+ORJSON_OPT = orjson.OPT_UTC_Z
+
+
 def _to_json_safe(obj):
-    """Convert an MT5 result (namedtuple or numpy.void) to a JSON-safe dict."""
+    """Convert an MT5 row (namedtuple or numpy.void) to a JSON-safe dict."""
+    if obj is None:
+        return None
     if hasattr(obj, "_asdict"):
         d = obj._asdict()
     elif hasattr(obj, "dtype"):
         d = {name: obj[name] for name in obj.dtype.names}
     else:
-        d = obj
-    out = {}
-    for k, v in d.items():
-        if isinstance(v, (np.integer,)):
-            out[k] = int(v)
-        elif isinstance(v, (np.floating,)):
-            out[k] = float(v)
-        elif isinstance(v, np.bool_):
-            out[k] = bool(v)
-        elif isinstance(v, np.ndarray):
-            out[k] = v.tolist()
-        else:
-            out[k] = v
-    return out
+        d = dict(obj)
+    # Cast any numpy type leftovers (intc, etc) that orjson won't handle
+    return {k: int(v) if isinstance(v, np.integer) else float(v) if isinstance(v, np.floating) else bool(v) if isinstance(v, np.bool_) else v for k, v in d.items()}
 
 
 def _rows_to_json(rows):
-    """Convert an iterable of MT5 rows to a list of JSON-safe dicts."""
+    """Convert MT5 rows to list of dicts."""
     if rows is None:
         return []
     return [_to_json_safe(r) for r in rows]
@@ -64,19 +60,21 @@ def _rows_to_json(rows):
 # MQL5 ENUM_BOOK_TYPE: BOOK_TYPE_SELL=0 (Offer/ASK), BOOK_TYPE_BUY=1 (Bid)
 # Python MetaTrader5 adds 1: BOOK_TYPE_SELL=1, BOOK_TYPE_BUY=2
 # This is standard across all brokers — do NOT use price heuristics.
-DOM_TYPE_BID = mt5.BOOK_TYPE_BUY   # = 2
+DOM_TYPE_BID = mt5.BOOK_TYPE_BUY  # = 2
 DOM_TYPE_ASK = mt5.BOOK_TYPE_SELL  # = 1
 
 # ── Bar Accumulator ────────────────────────────────────────────────────
 
+
 @dataclass
 class BarAccumulator:
     """Accumulates DOM mid-price ticks into OHLCV bars for one symbol/timeframe."""
+
     symbol: str
     timeframe_secs: int
     open: float = 0.0
     high: float = 0.0
-    low: float = float('inf')
+    low: float = float("inf")
     close: float = 0.0
     volume: float = 0.0
     bar_open_ns: int = 0
@@ -88,19 +86,21 @@ class BarAccumulator:
         bar_start = (ts_ns // tf_ns) * tf_ns
 
         if self.bar_open_ns != 0 and bar_start != self.bar_open_ns:
-            self._pending.append({
-                "type": "bar",
-                "symbol": self.symbol,
-                "timeframe_secs": self.timeframe_secs,
-                "open": self.open,
-                "high": self.high,
-                "low": self.low if self.low != float('inf') else self.open,
-                "close": self.close,
-                "volume": int(self.volume),
-                "tick_count": self.tick_count,
-                "ts_open_ns": self.bar_open_ns,
-                "ts_close_ns": ts_ns,
-            })
+            self._pending.append(
+                {
+                    "type": "bar",
+                    "symbol": self.symbol,
+                    "timeframe_secs": self.timeframe_secs,
+                    "open": self.open,
+                    "high": self.high,
+                    "low": self.low if self.low != float("inf") else self.open,
+                    "close": self.close,
+                    "volume": int(self.volume),
+                    "tick_count": self.tick_count,
+                    "ts_open_ns": self.bar_open_ns,
+                    "ts_close_ns": ts_ns,
+                }
+            )
             self.open = mid
             self.high = mid
             self.low = mid
@@ -124,6 +124,7 @@ class BarAccumulator:
 
 
 # ── Bridge ─────────────────────────────────────────────────────────────
+
 
 class MT5WSBridge:
     """Main bridge: MT5 DOM → WS bar push + REST RPC for orders/positions."""
@@ -261,7 +262,7 @@ class MT5WSBridge:
                     all_bars.extend(bars)
 
                 if all_bars:
-                    msg = json.dumps({"type": "bars", "data": all_bars})
+                    msg = orjson.dumps({"type": "bars", "data": all_bars}, option=ORJSON_OPT).decode()
                     dead = set()
                     for ws in self._ws_clients:
                         try:
@@ -286,15 +287,15 @@ class MT5WSBridge:
         # Replay last bars for reconnecting client
         if self._last_bars:
             replay = list(self._last_bars.values())
-            await ws.send_str(json.dumps({"type": "bars", "data": replay}))
+            await ws.send_str(orjson.dumps({"type": "bars", "data": replay}, option=ORJSON_OPT).decode())
 
         try:
             async for msg in ws:
                 if msg.type == web.WSMsgType.TEXT:
                     try:
-                        data = json.loads(msg.data)
+                        data = orjson.loads(msg.data)
                         await self._handle_ws_message(ws, data)
-                    except json.JSONDecodeError:
+                    except orjson.JSONDecodeError:
                         logger.warning(f"Bad WS JSON: {msg.data}")
                 elif msg.type == web.WSMsgType.ERROR:
                     logger.warning(f"WS error: {ws.exception()}")
@@ -311,24 +312,23 @@ class MT5WSBridge:
             timeframes = data.get("timeframes", [60])
             try:
                 self.subscribe_dom(symbol, timeframes)
-                await ws.send_str(json.dumps({
-                    "type": "subscribed",
-                    "symbol": symbol,
-                    "timeframes": timeframes,
-                }))
+                await ws.send_str(orjson.dumps(
+                    {"type": "subscribed", "symbol": symbol, "timeframes": timeframes},
+                    option=ORJSON_OPT,
+                ).decode())
             except Exception as e:
-                await ws.send_str(json.dumps({
-                    "type": "error",
-                    "message": str(e),
-                }))
+                await ws.send_str(orjson.dumps(
+                    {"type": "error", "message": str(e)},
+                    option=ORJSON_OPT,
+                ).decode())
         elif cmd == "unsubscribe":
             self.unsubscribe_dom(data["symbol"])
-            await ws.send_str(json.dumps({
-                "type": "unsubscribed",
-                "symbol": data["symbol"],
-            }))
+            await ws.send_str(orjson.dumps(
+                {"type": "unsubscribed", "symbol": data["symbol"]},
+                option=ORJSON_OPT,
+            ).decode())
         elif cmd == "ping":
-            await ws.send_str(json.dumps({"type": "pong"}))
+            await ws.send_str(orjson.dumps({"type": "pong"}, option=ORJSON_OPT).decode())
         else:
             logger.warning(f"Unknown WS command: {cmd}")
 
@@ -337,8 +337,9 @@ class MT5WSBridge:
     async def _rest_handler(self, request):
         try:
             body = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
+        except JSONDecodeError:
+            body = orjson.dumps({"error": "Invalid JSON"}, option=ORJSON_OPT)
+            return web.Response(body=body, status=400, content_type="application/json")
 
         method = body.get("method", "")
         params = body.get("params", {})
@@ -346,10 +347,12 @@ class MT5WSBridge:
 
         try:
             result = await self._dispatch_rpc(method, params)
-            return web.json_response({"result": result})
+            body = orjson.dumps({"result": result}, option=ORJSON_OPT)
+            return web.Response(body=body, content_type="application/json")
         except Exception as e:
             logger.error(f"RPC {method} failed: {e}")
-            return web.json_response({"error": str(e)}, status=500)
+            body = orjson.dumps({"error": str(e)}, option=ORJSON_OPT)
+            return web.Response(body=body, status=500, content_type="application/json")
 
     async def _dispatch_rpc(self, method: str, params: dict) -> any:
         if method == "initialize":
@@ -372,42 +375,58 @@ class MT5WSBridge:
         elif method == "copy_rates_range":
             rates = await asyncio.to_thread(
                 mt5.copy_rates_range,
-                params["symbol"], params["timeframe"],
-                params["date_from"], params["date_to"],
+                params["symbol"],
+                params["timeframe"],
+                params["date_from"],
+                params["date_to"],
             )
             return _rows_to_json(rates)
 
         elif method == "copy_rates_from_pos":
             rates = await asyncio.to_thread(
                 mt5.copy_rates_from_pos,
-                params["symbol"], params["timeframe"],
-                params.get("start_pos", 0), params.get("count", 100),
+                params["symbol"],
+                params["timeframe"],
+                params.get("start_pos", 0),
+                params.get("count", 100),
             )
             return _rows_to_json(rates)
 
         elif method == "order_send":
-            # mt5.order_send accepts a plain dict (official MT5 Python API convention)
             res = await asyncio.to_thread(mt5.order_send, params["request"])
-            return _to_json_safe(res) if res else {"retcode": -1, "comment": str(mt5.last_error())}
+            if res is None:
+                return {"retcode": -1, "comment": str(mt5.last_error())}
+            d = _to_json_safe(res)
+            if "request" in d:
+                d["request"] = _to_json_safe(d["request"])
+            return d
 
         elif method == "orders_get":
             symbol = params.get("symbol")
             if symbol:
-                return _rows_to_json(await asyncio.to_thread(mt5.orders_get, symbol=symbol))
+                return _rows_to_json(
+                    await asyncio.to_thread(mt5.orders_get, symbol=symbol)
+                )
             return _rows_to_json(await asyncio.to_thread(mt5.orders_get))
 
         elif method == "positions_get":
             symbol = params.get("symbol")
             if symbol:
-                return _rows_to_json(await asyncio.to_thread(mt5.positions_get, symbol=symbol))
+                return _rows_to_json(
+                    await asyncio.to_thread(mt5.positions_get, symbol=symbol)
+                )
             return _rows_to_json(await asyncio.to_thread(mt5.positions_get))
 
         elif method == "history_deals_get":
-            deals = await asyncio.to_thread(mt5.history_deals_get, params["date_from"], params["date_to"])
+            deals = await asyncio.to_thread(
+                mt5.history_deals_get, params["date_from"], params["date_to"]
+            )
             return _rows_to_json(deals)
 
         elif method == "history_orders_get":
-            orders = await asyncio.to_thread(mt5.history_orders_get, params["date_from"], params["date_to"])
+            orders = await asyncio.to_thread(
+                mt5.history_orders_get, params["date_from"], params["date_to"]
+            )
             return _rows_to_json(orders)
 
         elif method == "account_info":
@@ -461,6 +480,7 @@ class MT5WSBridge:
 
 
 # ── CLI ────────────────────────────────────────────────────────────────
+
 
 def main():
     parser = argparse.ArgumentParser(description="MT5 Bridge for Nautilus Trader")
