@@ -250,24 +250,17 @@ class MT5WSBridge:
                     bars = acc.drain()
                     all_bars.extend(bars)
 
-                # Sweep dead WS clients every cycle
-                dead_ws = set()
+                # Sweep dead WS clients when pushing bars
                 if all_bars:
                     msg = orjson.dumps({"type": "bars", "data": all_bars}, option=ORJSON_OPT).decode()
+                    dead_ws = set()
                     for ws in self._ws_authenticated:
                         try:
                             await ws.send_str(msg)
                         except Exception:
                             dead_ws.add(ws)
-                else:
-                    # Ping alive connections, discard dead ones
-                    for ws in list(self._ws_authenticated):
-                        try:
-                            await ws.ping()
-                        except Exception:
-                            dead_ws.add(ws)
-                if dead_ws:
-                    self._ws_authenticated -= dead_ws
+                    if dead_ws:
+                        self._ws_authenticated -= dead_ws
 
             except Exception as e:
                 logger.error(f"Poll loop error: {e}", exc_info=True)
@@ -303,11 +296,6 @@ class MT5WSBridge:
                 try:
                     msg = await ws.receive(timeout=30)
                 except asyncio.TimeoutError:
-                    # Send keepalive ping; if it fails, connection is dead
-                    try:
-                        await ws.send_str(orjson.dumps({"type": "pong"}, option=ORJSON_OPT).decode())
-                    except Exception:
-                        break
                     continue
                 if msg.type == web.WSMsgType.TEXT:
                     try:
