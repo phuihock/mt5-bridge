@@ -6,7 +6,7 @@ Architecture:
 
 Usage:
   python mt5_ws_bridge.py
-  python mt5_ws_bridge.py --mt5-path "C:\Program Files\Darwinex MetaTrader 5\terminal64.exe"
+  python mt5_ws_bridge.py --mt5-path "C:/Program Files/Darwinex MetaTrader 5/terminal64.exe"
 """
 
 import asyncio
