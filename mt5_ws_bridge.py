@@ -204,6 +204,7 @@ class MT5WSBridge:
         keys = [k for k in self._accumulators if k[0] == symbol]
         for k in keys:
             del self._accumulators[k]
+            self._last_bars.pop(k, None)
         logger.info(f"Unsubscribed: {symbol}")
 
     # ── DOM poll loop ──────────────────────────────────────────────
@@ -251,15 +252,24 @@ class MT5WSBridge:
                         self._last_bars[key] = bar
                     all_bars.extend(bars)
 
+                # Sweep dead WS clients every cycle
+                dead_ws = set()
                 if all_bars:
                     msg = orjson.dumps({"type": "bars", "data": all_bars}, option=ORJSON_OPT).decode()
-                    dead = set()
                     for ws in self._ws_authenticated:
                         try:
                             await ws.send_str(msg)
                         except Exception:
-                            dead.add(ws)
-                    self._ws_authenticated -= dead
+                            dead_ws.add(ws)
+                else:
+                    # Ping alive connections, discard dead ones
+                    for ws in list(self._ws_authenticated):
+                        try:
+                            await ws.ping()
+                        except Exception:
+                            dead_ws.add(ws)
+                if dead_ws:
+                    self._ws_authenticated -= dead_ws
 
             except Exception as e:
                 logger.error(f"Poll loop error: {e}", exc_info=True)
@@ -296,7 +306,16 @@ class MT5WSBridge:
             await ws.send_str(orjson.dumps({"type": "bars", "data": replay}, option=ORJSON_OPT).decode())
 
         try:
-            async for msg in ws:
+            while True:
+                try:
+                    msg = await ws.receive(timeout=30)
+                except asyncio.TimeoutError:
+                    # Send keepalive ping; if it fails, connection is dead
+                    try:
+                        await ws.send_str(orjson.dumps({"type": "pong"}, option=ORJSON_OPT).decode())
+                    except Exception:
+                        break
+                    continue
                 if msg.type == web.WSMsgType.TEXT:
                     try:
                         data = orjson.loads(msg.data)
@@ -305,6 +324,8 @@ class MT5WSBridge:
                         logger.warning(f"Bad WS JSON: {msg.data}")
                 elif msg.type == web.WSMsgType.ERROR:
                     logger.warning(f"WS error: {ws.exception()}")
+                    break
+                elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSED):
                     break
         finally:
             self._ws_authenticated.discard(ws)
