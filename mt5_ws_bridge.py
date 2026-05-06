@@ -127,7 +127,7 @@ class MT5WSBridge:
         self._running = False
         self._ws_authenticated: set[web.WebSocketResponse] = set()
         self._accumulators: dict[tuple[str, int], BarAccumulator] = {}
-        self._last_bars: dict[tuple[str, int], dict] = {}  # for WS reconnect replay
+
 
         # DOM type mapping: hard-coded per MQL5 standard
         # Health
@@ -204,7 +204,7 @@ class MT5WSBridge:
         keys = [k for k in self._accumulators if k[0] == symbol]
         for k in keys:
             del self._accumulators[k]
-            self._last_bars.pop(k, None)
+
         logger.info(f"Unsubscribed: {symbol}")
 
     # ── DOM poll loop ──────────────────────────────────────────────
@@ -248,8 +248,6 @@ class MT5WSBridge:
                 all_bars = []
                 for key, acc in self._accumulators.items():
                     bars = acc.drain()
-                    for bar in bars:
-                        self._last_bars[key] = bar
                     all_bars.extend(bars)
 
                 # Sweep dead WS clients every cycle
@@ -299,11 +297,6 @@ class MT5WSBridge:
 
         self._ws_authenticated.add(ws)
         logger.info(f"WS client authenticated ({len(self._ws_authenticated)} total)")
-
-        # Replay last bars for reconnecting client
-        if self._last_bars:
-            replay = list(self._last_bars.values())
-            await ws.send_str(orjson.dumps({"type": "bars", "data": replay}, option=ORJSON_OPT).decode())
 
         try:
             while True:
