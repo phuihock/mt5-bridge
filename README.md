@@ -1,6 +1,19 @@
 # MT5 Bridge
 
-Connects MetaTrader 5 (Darwinex) to Nautilus Trader on WSL2. Runs on Windows where MT5 terminal lives.
+Connects any MetaTrader 5 terminal to your algo trading system across Windows and WSL2. Runs where the MT5 terminal lives.
+
+Two transports instead of one: WebSocket pushes completed OHLCV bars from DOM mid-price in real time; HTTP REST handles orders, positions, and account queries. No polling, no MCP overhead — wire it straight into your algo trading system.
+
+### Pain points solved
+
+| Problem | How this project helps |
+|---|---|
+| MT5 lives on Windows, your algo stack on Linux/WSL2 | Cross-platform bridge over WS + REST — no need to run Python bots on Windows |
+| Single-transport connectors force polling | Dual transport: WebSocket pushes real-time data, REST handles request/reply |
+| Tick-level DOM noise overwhelms strategies | `BarAccumulator` produces clean OHLCV bars from DOM mid-price at configurable timeframes |
+| Reconnect loses data | Replays last completed bar per (symbol, timeframe) after reconnect — no gaps |
+| Bridges lack built-in auth | Optional API key on both transports (Bearer header / WS first-message). Production-safe |
+| Every client needs its own SDK | Standard WebSocket + HTTP REST — `curl`, Python, JS, anything that speaks HTTP or WS
 
 ## Architecture
 
