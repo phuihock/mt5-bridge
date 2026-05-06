@@ -52,13 +52,6 @@ def to_python(obj):
     return obj
 
 
-# ── DOM type constants ───────────────────────────────────────────────
-# MQL5 ENUM_BOOK_TYPE: BOOK_TYPE_SELL=0 (Offer/ASK), BOOK_TYPE_BUY=1 (Bid)
-# Python MetaTrader5 adds 1: BOOK_TYPE_SELL=1, BOOK_TYPE_BUY=2
-# This is standard across all brokers — do NOT use price heuristics.
-DOM_TYPE_BID = mt5.BOOK_TYPE_BUY  # = 2
-DOM_TYPE_ASK = mt5.BOOK_TYPE_SELL  # = 1
-
 # ── Bar Accumulator ────────────────────────────────────────────────────
 
 
@@ -137,9 +130,6 @@ class MT5WSBridge:
         self._last_bars: dict[tuple[str, int], dict] = {}  # for WS reconnect replay
 
         # DOM type mapping: hard-coded per MQL5 standard
-        self._bid_type = DOM_TYPE_BID  # = mt5.BOOK_TYPE_BUY = 2
-        self._ask_type = DOM_TYPE_ASK  # = mt5.BOOK_TYPE_SELL = 1
-
         # Health
         self._mt5_ok = False
         self._last_health_check = 0.0
@@ -236,10 +226,10 @@ class MT5WSBridge:
                     total_vol = 0.0
                     for item in items:
                         total_vol += item.volume_dbl
-                        if item.type == self._bid_type:
+                        if item.type == mt5.BOOK_TYPE_BUY:
                             if best_bid is None or item.price > best_bid:
                                 best_bid = item.price
-                        elif item.type == self._ask_type:
+                        elif item.type == mt5.BOOK_TYPE_SELL:
                             if best_ask is None or item.price < best_ask:
                                 best_ask = item.price
 
