@@ -148,6 +148,27 @@ Timeframes: `1` (M1), `5` (M5), `15` (M15), `30` (M30), `16385` (H1), `16388` (H
 | `history_deals_get` | `date_from, date_to` | Deal history |
 | `history_orders_get` | `date_from, date_to` | Order history |
 
+### Constants
+
+The bridge passes `request` dicts directly to `mt5.order_send()`. Import the constants from `MetaTrader5` — no need to memorize raw values:
+
+```python
+import MetaTrader5 as mt5
+
+# Market BUY
+order_send({
+    "action": mt5.TRADE_ACTION_DEAL,
+    "type": mt5.ORDER_TYPE_BUY,
+    "symbol": "EURUSD", "volume": 0.01,
+    "price": 0.0, "deviation": 10, "magic": 123456,
+    "type_time": mt5.ORDER_TIME_GTC,
+    "type_filling": mt5.ORDER_FILLING_IOC,
+})
+
+# Cancel pending order
+order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": ticket})
+```
+
 ### Example: Place + Close
 
 ```python
@@ -237,14 +258,7 @@ On reconnect, the bridge replays the last completed bar per (symbol, timeframe) 
 
 Bars are built from the **mid-price** of best bid/ask in the Depth of Market. The bridge polls `market_book_get()` at 50ms intervals and accumulates into OHLCV bars.
 
-**DOM type mapping (MQL5 standard):**
-
-```
-MQL5:  BOOK_TYPE_SELL=0 (Offer/ASK)  → mt5.BOOK_TYPE_SELL=1
-       BOOK_TYPE_BUY=1  (Bid)        → mt5.BOOK_TYPE_BUY=2
-```
-
-Python `MetaTrader5` adds 1 to the MQL5 enum values.
+DOM types use `mt5.BOOK_TYPE_BUY` (bid) and `mt5.BOOK_TYPE_SELL` (ask) directly — no hardcoded constants needed.
 
 ## Serialization
 

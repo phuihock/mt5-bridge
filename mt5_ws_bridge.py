@@ -193,8 +193,6 @@ class MT5WSBridge:
         else:
             self._last_account_info = info
 
-    # DOM types are hard-coded per MQL5 standard — no detection needed.
-
     # ── DOM subscription ───────────────────────────────────────────
 
     def subscribe_dom(self, symbol: str, timeframes_secs: list[int]):
