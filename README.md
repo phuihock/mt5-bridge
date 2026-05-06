@@ -150,68 +150,33 @@ Timeframes: `1` (M1), `5` (M5), `15` (M15), `30` (M30), `16385` (H1), `16388` (H
 
 ### Constants
 
-`MetaTrader5` Python package cannot be installed on Linux/WSL. Use the raw integer values below when calling the bridge from WSL2 or any non-Windows client.
+`MetaTrader5` Python package cannot be installed on Linux/WSL. Callers running outside Windows can `import` the constants from this repo's [`constants.py`](constants.py) instead:
 
-**Trade actions (`action`):**
+```python
+from constants import (
+    TRADE_ACTION_DEAL, TRADE_ACTION_PENDING, TRADE_ACTION_REMOVE,
+    ORDER_TYPE_BUY, ORDER_TYPE_SELL, ORDER_TYPE_BUY_LIMIT,
+    ORDER_TIME_GTC, ORDER_FILLING_IOC, ORDER_FILLING_RETURN,
+    TRADE_RETCODE_DONE,
+)
 
-| Constant | Value | Use |
-|---|---|---|
-| `TRADE_ACTION_DEAL` | `1` | Market order (place & close) |
-| `TRADE_ACTION_PENDING` | `5` | Place pending order |
-| `TRADE_ACTION_SLTP` | `6` | Modify SL/TP |
-| `TRADE_ACTION_MODIFY` | `7` | Modify pending order |
-| `TRADE_ACTION_REMOVE` | `8` | Cancel pending order |
-| `TRADE_ACTION_CLOSE_BY` | `10` | Close by opposite position |
+# Market BUY
+order_send({
+    "action": TRADE_ACTION_DEAL,
+    "type": ORDER_TYPE_BUY,
+    "symbol": "EURUSD", "volume": 0.01,
+    "price": 0.0, "deviation": 10, "magic": 123456,
+    "type_time": ORDER_TIME_GTC,
+    "type_filling": ORDER_FILLING_IOC,
+})
 
-**Order types (`type`):**
+# Cancel pending order
+order_send({"action": TRADE_ACTION_REMOVE, "order": ticket})
+```
 
-| Constant | Value |
-|---|---|
-| `ORDER_TYPE_BUY` | `0` |
-| `ORDER_TYPE_SELL` | `1` |
-| `ORDER_TYPE_BUY_LIMIT` | `2` |
-| `ORDER_TYPE_SELL_LIMIT` | `3` |
-| `ORDER_TYPE_BUY_STOP` | `4` |
-| `ORDER_TYPE_SELL_STOP` | `5` |
-| `ORDER_TYPE_BUY_STOP_LIMIT` | `6` |
-| `ORDER_TYPE_SELL_STOP_LIMIT` | `7` |
-
-**Time in force (`type_time`):**
-
-| Constant | Value |
-|---|---|
-| `ORDER_TIME_GTC` | `0` |
-| `ORDER_TIME_DAY` | `1` |
-| `ORDER_TIME_SPECIFIED` | `2` |
-| `ORDER_TIME_SPECIFIED_DAY` | `3` |
-
-**Filling modes (`type_filling`):**
-
-| Constant | Value |
-|---|---|
-| `ORDER_FILLING_FOK` | `0` |
-| `ORDER_FILLING_IOC` | `1` |
-| `ORDER_FILLING_RETURN` | `2` |
-| `ORDER_FILLING_BOC` | `3` |
-
-**Common retcodes:**
-
-| Constant | Value | Meaning |
-|---|---|---|
-| `TRADE_RETCODE_DONE` | `10009` | Request executed successfully |
-| `TRADE_RETCODE_INVALID` | `10013` | Invalid request (malformed fields) |
-| `TRADE_RETCODE_INVALID_PRICE` | `10015` | Price out of bounds or wrong tick |
-| `TRADE_RETCODE_INVALID_STOPS` | `10016` | SL/TP too close to market |
-| `TRADE_RETCODE_MARKET_CLOSED` | `10018` | Market not open |
-| `TRADE_RETCODE_NO_MONEY` | `10019` | Insufficient margin |
-| `TRADE_RETCODE_INVALID_FILL` | `10030` | Filling mode not supported by broker/symbol |
-| `TRADE_RETCODE_REQUOTE` | `10004` | Price changed during request |
-| `TRADE_RETCODE_FROZEN` | `10029` | Symbol frozen (no trading) |
-| `TRADE_RETCODE_TIMEOUT` | `10012` | Request timed out |
-| `TRADE_RETCODE_ERROR` | `10011` | Common error |
-
-> ⚠️ Common pitfall: `TRADE_ACTION_REMOVE` is **`8`**, not `6`. Value `6` is `TRADE_ACTION_SLTP`. The minimal cancel request is `{"action": 8, "order": <ticket>}`.
-> Another pitfall: `action=2` is `TRADE_ACTION_DEAL` (market order), not pending. Use `action=5` (`TRADE_ACTION_PENDING`) for pending orders.
+> ⚠️ `TRADE_ACTION_REMOVE` = `8` (not `6`). See [`constants.py`](constants.py) for the full list of 223 constants.
+>
+> Regenerate with: `python scripts/dump_mt5_constants.py --py` (Windows only).
 
 ### Example: Place + Close
 

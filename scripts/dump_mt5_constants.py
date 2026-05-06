@@ -1,16 +1,17 @@
-"""Dump all MetaTrader5 integer constants to stdout as JSON or Python module.
+"""Dump all MetaTrader5 integer constants.
 
 Usage:
-    python scripts/dump_mt5_constants.py             # pretty JSON
-    python scripts/dump_mt5_constants.py --compact   # compact JSON
-    python scripts/dump_mt5_constants.py --py        # Python module
+    python scripts/dump_mt5_constants.py       # JSON to stdout
+    python scripts/dump_mt5_constants.py --py  # overwrite constants.py
 """
 
-import argparse
 import json
+import os
 import re
+import sys
 import MetaTrader5 as mt5
 
+CONSTANTS_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "constants.py")
 
 PREFIX_ORDER = [
     "TRADE_ACTION", "ORDER_TYPE", "ORDER_STATE", "ORDER_TIME", "ORDER_FILLING",
@@ -50,22 +51,32 @@ def _sort_key(item):
     return (len(PREFIX_ORDER), name)
 
 
-def dump_json(compact: bool = False):
+def dump_json():
     data = extract()
-    print(json.dumps(data, indent=None if compact else 2, sort_keys=True))
+    print(json.dumps(data, indent=2, sort_keys=True))
 
 
-def dump_py():
+def dump_py(out=None):
+    """Write Python module to *out* (file-like object or path string)."""
+    close = False
+    if isinstance(out, str):
+        out = open(out, "w", newline="")
+        close = True
+    elif out is None:
+        out = sys.stdout
     data = extract()
     items = sorted(data.items(), key=_sort_key)
 
-    print(f"# Auto-generated from MetaTrader5 {mt5.__version__}")
-    print(f"# Python {mt5.__version__}")
-    print()
+    def w(s=""):
+        out.write(s)
+        out.write("\n")
+
+    w(f"# Auto-generated from MetaTrader5 {mt5.__version__}")
+    w(f"# Python {mt5.__version__}")
+    w()
 
     last_prefix = None
     for name, val in items:
-        # Find the longest matching prefix for a section header
         prefix = None
         for p in sorted(PREFIX_ORDER, key=len, reverse=True):
             if name.startswith(p):
@@ -73,21 +84,20 @@ def dump_py():
                 break
 
         if prefix != last_prefix and prefix:
-            print()
-            print(f"# ── {prefix} ──")
+            w()
+            w(f"# ── {prefix} ──")
             last_prefix = prefix
 
-        print(f"{name} = {val}")
-    print()
+        w(f"{name} = {val}")
+    w()
+
+    if close:
+        out.close()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Dump MT5 constants")
-    parser.add_argument("--compact", action="store_true")
-    parser.add_argument("--py", action="store_true")
-    args = parser.parse_args()
-
-    if args.py:
-        dump_py()
+    if "--py" in sys.argv:
+        dump_py(CONSTANTS_PATH)
+        print(f"Wrote {CONSTANTS_PATH}")
     else:
-        dump_json(compact=args.compact)
+        dump_json()
