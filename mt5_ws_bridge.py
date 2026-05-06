@@ -10,6 +10,7 @@ Usage:
 """
 
 import asyncio
+import os
 import time
 import logging
 import signal
@@ -124,13 +125,14 @@ class BarAccumulator:
 class MT5WSBridge:
     """Main bridge: MT5 DOM → WS bar push + REST RPC for orders/positions."""
 
-    def __init__(self, ws_port=9876, rest_port=9877, mt5_path: str = None):
+    def __init__(self, ws_port=9876, rest_port=9877, mt5_path: str = None, api_key: str = None):
         self.ws_port = ws_port
         self.rest_port = rest_port
         self.mt5_path = mt5_path
+        self._api_key = api_key
 
         self._running = False
-        self._ws_clients: set[web.WebSocketResponse] = set()
+        self._ws_authenticated: set[web.WebSocketResponse] = set()
         self._accumulators: dict[tuple[str, int], BarAccumulator] = {}
         self._last_bars: dict[tuple[str, int], dict] = {}  # for WS reconnect replay
 
@@ -172,6 +174,11 @@ class MT5WSBridge:
             pass
         self._mt5_ok = False
         logger.info("MT5 shut down")
+
+    def _check_api_key(self, provided: str) -> bool:
+        if not self._api_key:
+            return True  # no key configured = open
+        return provided == self._api_key
 
     def check_health(self):
         now = time.time()
@@ -259,12 +266,12 @@ class MT5WSBridge:
                 if all_bars:
                     msg = orjson.dumps({"type": "bars", "data": all_bars}, option=ORJSON_OPT).decode()
                     dead = set()
-                    for ws in self._ws_clients:
+                    for ws in self._ws_authenticated:
                         try:
                             await ws.send_str(msg)
                         except Exception:
                             dead.add(ws)
-                    self._ws_clients -= dead
+                    self._ws_authenticated -= dead
 
             except Exception as e:
                 logger.error(f"Poll loop error: {e}", exc_info=True)
@@ -276,8 +283,24 @@ class MT5WSBridge:
     async def _ws_handler(self, request):
         ws = web.WebSocketResponse(max_msg_size=65536)
         await ws.prepare(request)
-        self._ws_clients.add(ws)
-        logger.info(f"WS client connected ({len(self._ws_clients)} total)")
+
+        # First message MUST be auth
+        try:
+            msg = await ws.receive(timeout=10)
+            if msg.type != web.WSMsgType.TEXT:
+                await ws.close(code=4000, message=b"Auth required")
+                return ws
+            data = orjson.loads(msg.data)
+            if data.get("type") != "auth" or not self._check_api_key(data.get("api_key", "")):
+                await ws.send_str(orjson.dumps({"type": "error", "message": "invalid api_key"}, option=ORJSON_OPT).decode())
+                await ws.close(code=4001, message=b"Invalid api_key")
+                return ws
+        except asyncio.TimeoutError:
+            await ws.close(code=4000, message=b"Auth timeout")
+            return ws
+
+        self._ws_authenticated.add(ws)
+        logger.info(f"WS client authenticated ({len(self._ws_authenticated)} total)")
 
         # Replay last bars for reconnecting client
         if self._last_bars:
@@ -296,8 +319,8 @@ class MT5WSBridge:
                     logger.warning(f"WS error: {ws.exception()}")
                     break
         finally:
-            self._ws_clients.discard(ws)
-            logger.info(f"WS client left ({len(self._ws_clients)} remaining)")
+            self._ws_authenticated.discard(ws)
+            logger.info(f"WS client left ({len(self._ws_authenticated)} remaining)")
         return ws
 
     async def _handle_ws_message(self, ws, data: dict):
@@ -330,6 +353,13 @@ class MT5WSBridge:
     # ── REST RPC handler ───────────────────────────────────────────
 
     async def _rest_handler(self, request):
+        # API key via Authorization: Bearer <key> header
+        auth = request.headers.get("Authorization", "")
+        provided_key = auth.removeprefix("Bearer ").strip()
+        if not self._check_api_key(provided_key):
+            body = orjson.dumps({"error": "invalid api_key"}, option=ORJSON_OPT)
+            return web.Response(body=body, status=401, content_type="application/json")
+
         try:
             body = await request.json()
         except (ValueError, orjson.JSONDecodeError):
@@ -382,6 +412,18 @@ class MT5WSBridge:
                 params.get("start_pos", 0), params.get("count", 100),
             )
             return to_python(rates)
+
+        elif method == "market_book_add":
+            ok = await asyncio.to_thread(mt5.market_book_add, params["symbol"])
+            if not ok:
+                raise RuntimeError(f"market_book_add failed: {mt5.last_error()}")
+            return True
+
+        elif method == "market_book_get":
+            return to_python(await asyncio.to_thread(mt5.market_book_get, params["symbol"]))
+
+        elif method == "market_book_release":
+            return await asyncio.to_thread(mt5.market_book_release, params["symbol"])
 
         elif method == "order_send":
             res = await asyncio.to_thread(mt5.order_send, params["request"])
@@ -449,6 +491,13 @@ class MT5WSBridge:
 
     def stop(self):
         self._running = False
+        # Close all WS connections
+        for ws in set(self._ws_authenticated):
+            try:
+                ws._resp.close()  # force close underlying response
+            except Exception:
+                pass
+        self._ws_authenticated.clear()
         symbols = set(k[0] for k in self._accumulators)
         for s in symbols:
             try:
@@ -467,6 +516,7 @@ def main():
     parser.add_argument("--mt5-path", help="Path to terminal64.exe")
     parser.add_argument("--ws-port", type=int, default=9876)
     parser.add_argument("--rest-port", type=int, default=9877)
+    parser.add_argument("--api-key", default=None, help="API key for WS & REST auth (default: from MT5_API_KEY env)")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -476,10 +526,15 @@ def main():
         datefmt="%H:%M:%S",
     )
 
+    api_key = args.api_key or os.environ.get("MT5_API_KEY")
+    if api_key:
+        logger.info("API key auth enabled")
+
     bridge = MT5WSBridge(
         ws_port=args.ws_port,
         rest_port=args.rest_port,
         mt5_path=args.mt5_path,
+        api_key=api_key,
     )
 
     async def run():

@@ -3,12 +3,13 @@ import asyncio
 import json
 import pytest
 from aiohttp import ClientSession, WSMsgType
+from conftest import WS_URL, API_KEY
 
-WS_URL = "ws://127.0.0.1:9876/ws"
 
-
-async def _drain_ws(ws):
-    """Drain initial replay bars that arrive on WS connect."""
+async def _auth(ws):
+    """Authenticate and drain replay bars."""
+    await ws.send_json({"type": "auth", "api_key": API_KEY})
+    # Drain replay bars that arrive immediately after successful auth
     while True:
         try:
             await ws.receive(timeout=0.3)
@@ -20,7 +21,7 @@ async def _drain_ws(ws):
 async def test_ws_subscribe_confirmed():
     async with ClientSession() as session:
         async with session.ws_connect(WS_URL) as ws:
-            await _drain_ws(ws)
+            await _auth(ws)
             await ws.send_json({"type": "subscribe", "symbol": "EURUSD", "timeframes": [60]})
             msg = await ws.receive(timeout=5)
             data = json.loads(msg.data)
@@ -35,6 +36,7 @@ async def test_ws_bar_arrives():
     """Wait up to 70s for a completed M1 bar via WS push."""
     async with ClientSession() as session:
         async with session.ws_connect(WS_URL) as ws:
+            await _auth(ws)
             await ws.send_json({"type": "subscribe", "symbol": "EURUSD", "timeframes": [60]})
             bar_received = False
             for _ in range(70):
@@ -60,7 +62,7 @@ async def test_ws_bar_arrives():
 async def test_ws_ping_pong():
     async with ClientSession() as session:
         async with session.ws_connect(WS_URL) as ws:
-            await _drain_ws(ws)
+            await _auth(ws)
             await ws.send_json({"type": "ping"})
             msg = await ws.receive(timeout=5)
             data = json.loads(msg.data)
